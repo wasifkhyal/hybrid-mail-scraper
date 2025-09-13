@@ -10,6 +10,7 @@ export default async function handler(req, res) {
 
   try {
     const { data } = await axios.get(url, { timeout: 10000 });
+
     const emails = [];
     const regex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
     const found = data.match(regex);
