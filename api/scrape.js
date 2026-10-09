@@ -14,7 +14,6 @@ const BANNED_DOMAINS = [
   "github.com", "cloudflare.com"
 ];
 
-// Full browser headers to prevent 403 Forbidden blocks
 const BROWSER_HEADERS = {
   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -30,39 +29,27 @@ const BROWSER_HEADERS = {
   "Upgrade-Insecure-Requests": "1"
 };
 
-/**
- * Validates whether candidate string is a real email
- */
 function isValidEmail(candidate) {
   if (!candidate || typeof candidate !== "string") return false;
   const clean = candidate.trim().toLowerCase();
 
-  // Basic regex check
   const regex = /^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$/;
   if (!regex.test(clean)) return false;
 
-  // Filter out image/asset filenames (e.g. logo@2x.png)
   for (const ext of BANNED_EXTENSIONS) {
     if (clean.endsWith(ext)) return false;
   }
 
-  // Filter out banned/dummy domains
   const domainPart = clean.split("@")[1];
   if (!domainPart || BANNED_DOMAINS.includes(domainPart)) return false;
-
-  // Reject strings that are too long or too short
   if (clean.length > 80 || clean.length < 6) return false;
 
   return true;
 }
 
-/**
- * Extracts emails from clean Cheerio DOM
- */
 function extractEmailsFromDom($) {
   const foundEmails = new Set();
 
-  // 1. High priority: mailto links
   $('a[href*="mailto:"]').each((_, el) => {
     const href = $(el).attr("href") || "";
     const match = href.match(/mailto:([^?&"'>\s]+)/i);
@@ -74,16 +61,13 @@ function extractEmailsFromDom($) {
     }
   });
 
-  // 2. Remove script/style tags to avoid library and webpack noise
   $("script, style, noscript, svg, code, pre, img, video, audio").remove();
 
-  // 3. Scan visible body text
   const text = $("body").text() || "";
   const broadRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
   const matches = text.match(broadRegex) || [];
 
   for (let m of matches) {
-    // Strip trailing punctuation often caught in sentences
     m = m.replace(/[.,;:!?)'"\\]+$/, "").trim().toLowerCase();
     if (isValidEmail(m)) {
       foundEmails.add(m);
@@ -93,9 +77,6 @@ function extractEmailsFromDom($) {
   return Array.from(foundEmails);
 }
 
-/**
- * Fetch HTML safely with fallback to HTTP if HTTPS fails
- */
 async function fetchHtml(url) {
   try {
     const res = await axios.get(url, {
@@ -106,7 +87,6 @@ async function fetchHtml(url) {
     });
     return typeof res.data === "string" ? res.data : "";
   } catch (err) {
-    // If https fails, try plain http once
     if (url.startsWith("https://")) {
       try {
         const httpUrl = url.replace("https://", "http://");
@@ -125,22 +105,16 @@ async function fetchHtml(url) {
   }
 }
 
-/**
- * Detect contact / about links in the page
- */
 function findContactLinks(baseUrl, $) {
   const links = new Set();
   const keywords = ["contact", "about", "team", "reach", "help", "imprint", "support"];
-
   const baseObj = new URL(baseUrl);
 
   $("a").each((_, el) => {
     const href = ($(el).attr("href") || "").trim();
     const text = ($(el).text() || "").toLowerCase().trim();
 
-    if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:")) {
-      return;
-    }
+    if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:")) return;
 
     const lowerHref = href.toLowerCase();
     const hasKeyword = keywords.some(k => lowerHref.includes(k) || text.includes(k));
@@ -151,25 +125,18 @@ function findContactLinks(baseUrl, $) {
         if (fullUrl.hostname === baseObj.hostname) {
           links.add(fullUrl.href);
         }
-      } catch (e) {
-        // ignore malformed URLs
-      }
+      } catch (e) {}
     }
   });
 
-  // If no contact links were in the HTML, try common standard routes
   if (links.size === 0) {
     links.add(`${baseObj.origin}/contact`);
     links.add(`${baseObj.origin}/about`);
   }
 
-  // Limit to maximum 3 candidate pages to respect execution time
   return Array.from(links).slice(0, 3);
 }
 
-/**
- * Optional Serper fallback
- */
 async function serperFallback(domain, apiKey) {
   if (!apiKey) return [];
   try {
@@ -197,11 +164,8 @@ export default async function handler(req, res) {
     }
 
     let rawUrl = (req.query.url || "").trim();
-    if (!rawUrl) {
-      return res.status(400).json({ error: "Missing ?url= parameter" });
-    }
+    if (!rawUrl) return res.status(400).json({ error: "Missing ?url= parameter" });
 
-    // Ensure protocol is present
     if (!rawUrl.startsWith("http://") && !rawUrl.startsWith("https://")) {
       rawUrl = "https://" + rawUrl;
     }
@@ -215,15 +179,39 @@ export default async function handler(req, res) {
 
     const targetUrl = parsedUrl.href;
     const allEmails = new Set();
+    let pageTitle = "";
+    let pageSnippet = "";
 
     // 1) Fetch and inspect homepage
     const homeHtml = await fetchHtml(targetUrl);
     if (homeHtml) {
       const $ = cheerio.load(homeHtml);
+
+      // Extract title: og:title -> title tag -> twitter:title
+      pageTitle = (
+        $('meta[property="og:title"]').attr("content") ||
+        $("title").text() ||
+        $('meta[name="twitter:title"]').attr("content") ||
+        ""
+      ).trim();
+
+      // Extract snippet / description: meta description -> og:description -> twitter:description
+      pageSnippet = (
+        $('meta[name="description"]').attr("content") ||
+        $('meta[property="og:description"]').attr("content") ||
+        $('meta[name="twitter:description"]').attr("content") ||
+        ""
+      ).trim();
+
+      // Clean extra spaces / linebreaks
+      pageTitle = pageTitle.replace(/\s+/g, " ").substring(0, 300);
+      pageSnippet = pageSnippet.replace(/\s+/g, " ").substring(0, 500);
+
+      // Extract emails
       const homeEmails = extractEmailsFromDom($);
       homeEmails.forEach(e => allEmails.add(e));
 
-      // 2) If no email found on homepage, crawl contact & about pages
+      // 2) If no email on homepage, crawl contact pages
       if (allEmails.size === 0) {
         const candidatePages = findContactLinks(targetUrl, $);
         for (const pageUrl of candidatePages) {
@@ -232,13 +220,13 @@ export default async function handler(req, res) {
             const page$ = cheerio.load(pageHtml);
             const pageEmails = extractEmailsFromDom(page$);
             pageEmails.forEach(e => allEmails.add(e));
-            if (allEmails.size > 0) break; // Found emails, stop crawling
+            if (allEmails.size > 0) break;
           }
         }
       }
     }
 
-    // 3) Fallback: Serper search if still empty and key is present
+    // 3) Fallback: Serper search if key is present
     if (allEmails.size === 0 && process.env.SERPER_API_KEY) {
       const serperEmails = await serperFallback(parsedUrl.hostname, process.env.SERPER_API_KEY);
       serperEmails.forEach(e => allEmails.add(e));
@@ -246,7 +234,9 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       url: targetUrl,
-      emails: Array.from(allEmails)
+      emails: Array.from(allEmails),
+      title: pageTitle,
+      snippet: pageSnippet
     });
 
   } catch (err) {
