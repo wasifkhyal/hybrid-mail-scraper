@@ -29,6 +29,24 @@ const BROWSER_HEADERS = {
   "Upgrade-Insecure-Requests": "1"
 };
 
+/**
+ * Cloudflare Email Protection XOR Decoder
+ */
+function decodeCloudflareEmail(encodedString) {
+  if (!encodedString || typeof encodedString !== "string") return "";
+  try {
+    let email = "";
+    const key = parseInt(encodedString.substr(0, 2), 16);
+    for (let n = 2; n < encodedString.length; n += 2) {
+      const charCode = parseInt(encodedString.substr(n, 2), 16) ^ key;
+      email += String.fromCharCode(charCode);
+    }
+    return email.trim();
+  } catch (e) {
+    return "";
+  }
+}
+
 function isValidEmail(candidate) {
   if (!candidate || typeof candidate !== "string") return false;
   const clean = candidate.trim().toLowerCase();
@@ -50,6 +68,26 @@ function isValidEmail(candidate) {
 function extractEmailsFromDom($) {
   const foundEmails = new Set();
 
+  // 1. Decode Cloudflare protected emails (data-cfemail)
+  $("[data-cfemail]").each((_, el) => {
+    const encoded = $(el).attr("data-cfemail");
+    const decoded = decodeCloudflareEmail(encoded);
+    if (isValidEmail(decoded)) {
+      foundEmails.add(decoded.toLowerCase());
+    }
+  });
+
+  // Decode Cloudflare href protection links
+  $('a[href*="/cdn-cgi/l/email-protection#"]').each((_, el) => {
+    const href = $(el).attr("href") || "";
+    const encoded = href.split("#")[1];
+    const decoded = decodeCloudflareEmail(encoded);
+    if (isValidEmail(decoded)) {
+      foundEmails.add(decoded.toLowerCase());
+    }
+  });
+
+  // 2. Extract from standard mailto: links
   $('a[href*="mailto:"]').each((_, el) => {
     const href = $(el).attr("href") || "";
     const match = href.match(/mailto:([^?&"'>\s]+)/i);
@@ -61,9 +99,14 @@ function extractEmailsFromDom($) {
     }
   });
 
+  // 3. Remove non-visible/noisy elements
   $("script, style, noscript, svg, code, pre, img, video, audio").remove();
 
-  const text = $("body").text() || "";
+  // 4. Scan visible text with unmasking for [at] / (at) / [dot]
+  let text = $("body").text() || "";
+  text = text.replace(/\s*(\[at\]|\(at\))\s*/gi, "@")
+             .replace(/\s*(\[dot\]|\(dot\))\s*/gi, ".");
+
   const broadRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
   const matches = text.match(broadRegex) || [];
 
@@ -105,9 +148,16 @@ async function fetchHtml(url) {
   }
 }
 
-function findContactLinks(baseUrl, $) {
-  const links = new Set();
-  const keywords = ["contact", "about", "team", "reach", "help", "imprint", "support"];
+/**
+ * Finds contact, team, privacy, legal, and terms links
+ */
+function findContactAndLegalLinks(baseUrl, $) {
+  const contactLinks = new Set();
+  const legalLinks = new Set();
+
+  const contactKeywords = ["contact", "about", "team", "reach", "help", "support", "imprint", "press"];
+  const legalKeywords = ["privacy", "terms", "legal", "compliance", "policy"];
+
   const baseObj = new URL(baseUrl);
 
   $("a").each((_, el) => {
@@ -117,24 +167,36 @@ function findContactLinks(baseUrl, $) {
     if (!href || href.startsWith("#") || href.startsWith("javascript:") || href.startsWith("mailto:")) return;
 
     const lowerHref = href.toLowerCase();
-    const hasKeyword = keywords.some(k => lowerHref.includes(k) || text.includes(k));
 
-    if (hasKeyword) {
+    // Check contact match
+    if (contactKeywords.some(k => lowerHref.includes(k) || text.includes(k))) {
       try {
         const fullUrl = new URL(href, baseUrl);
-        if (fullUrl.hostname === baseObj.hostname) {
-          links.add(fullUrl.href);
-        }
+        if (fullUrl.hostname === baseObj.hostname) contactLinks.add(fullUrl.href);
+      } catch (e) {}
+    }
+
+    // Check privacy / legal match
+    if (legalKeywords.some(k => lowerHref.includes(k) || text.includes(k))) {
+      try {
+        const fullUrl = new URL(href, baseUrl);
+        if (fullUrl.hostname === baseObj.hostname) legalLinks.add(fullUrl.href);
       } catch (e) {}
     }
   });
 
-  if (links.size === 0) {
-    links.add(`${baseObj.origin}/contact`);
-    links.add(`${baseObj.origin}/about`);
+  // Prioritize contact pages first, followed by legal/privacy pages
+  const combined = [...Array.from(contactLinks).slice(0, 2), ...Array.from(legalLinks).slice(0, 2)];
+
+  // Fallback direct routes if nothing was discovered in the HTML
+  if (combined.length === 0) {
+    combined.push(`${baseObj.origin}/contact`);
+    combined.push(`${baseObj.origin}/about`);
+    combined.push(`${baseObj.origin}/privacy`);
+    combined.push(`${baseObj.origin}/privacy-policy`);
   }
 
-  return Array.from(links).slice(0, 3);
+  return combined.slice(0, 4);
 }
 
 async function serperFallback(domain, apiKey) {
@@ -182,12 +244,11 @@ export default async function handler(req, res) {
     let pageTitle = "";
     let pageSnippet = "";
 
-    // 1) Fetch and inspect homepage
+    // 1) Fetch homepage
     const homeHtml = await fetchHtml(targetUrl);
     if (homeHtml) {
       const $ = cheerio.load(homeHtml);
 
-      // Extract title: og:title -> title tag -> twitter:title
       pageTitle = (
         $('meta[property="og:title"]').attr("content") ||
         $("title").text() ||
@@ -195,7 +256,6 @@ export default async function handler(req, res) {
         ""
       ).trim();
 
-      // Extract snippet / description: meta description -> og:description -> twitter:description
       pageSnippet = (
         $('meta[name="description"]').attr("content") ||
         $('meta[property="og:description"]').attr("content") ||
@@ -203,35 +263,34 @@ export default async function handler(req, res) {
         ""
       ).trim();
 
-      // Clean extra spaces / linebreaks
       pageTitle = pageTitle.replace(/\s+/g, " ").substring(0, 300);
       pageSnippet = pageSnippet.replace(/\s+/g, " ").substring(0, 500);
 
-      // Extract emails
       const homeEmails = extractEmailsFromDom($);
       homeEmails.forEach(e => allEmails.add(e));
 
-      // 2) If no email on homepage, crawl contact pages
+      // 2) If no emails on homepage, crawl contact & legal pages
       if (allEmails.size === 0) {
-        const candidatePages = findContactLinks(targetUrl, $);
+        const candidatePages = findContactAndLegalLinks(targetUrl, $);
         for (const pageUrl of candidatePages) {
           const pageHtml = await fetchHtml(pageUrl);
           if (pageHtml) {
             const page$ = cheerio.load(pageHtml);
             const pageEmails = extractEmailsFromDom(page$);
             pageEmails.forEach(e => allEmails.add(e));
-            if (allEmails.size > 0) break;
+            if (allEmails.size > 0) break; // Found email, stop crawling
           }
         }
       }
     }
 
-    // 3) Fallback: Serper search if key is present
+    // 3) Fallback: Serper search if still empty and key is present
     if (allEmails.size === 0 && process.env.SERPER_API_KEY) {
       const serperEmails = await serperFallback(parsedUrl.hostname, process.env.SERPER_API_KEY);
       serperEmails.forEach(e => allEmails.add(e));
     }
 
+    // Exact response schema preserved
     return res.status(200).json({
       url: targetUrl,
       emails: Array.from(allEmails),
